@@ -185,7 +185,7 @@ def init_db():
         conn = psycopg2.connect(DATABASE_URL, sslmode=os.getenv("PGSSLMODE", "require"))
         try:
             cur = conn.cursor()
-            statements = [s.strip() for s in POSTGRES_SCHEMA.strip().split(";
+            statements = [s.strip() for s in POSTGRES_SCHEMA.strip().split(";\n\n") if s.strip()]
 
 ") if s.strip()]
             for stmt in statements:
