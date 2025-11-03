@@ -174,12 +174,28 @@ CREATE TABLE IF NOT EXISTS users (
 
 
 def init_db():
+    """Create tables if they don't exist.
+    Avoid using request-bound `g` so this can run at import time (gunicorn startup) without an app context.
+    """
     if using_postgres():
-        db = get_db()
-        for stmt in POSTGRES_SCHEMA.strip().split(";\n\n"):
-            if stmt.strip():
-                db.execute(stmt)
-        db.commit()
+        if psycopg2 is None:
+            raise RuntimeError("psycopg2 is required for PostgreSQL but not installed. pip install psycopg2-binary")
+        # Use a direct psycopg2 connection instead of get_db()/g
+        conn = psycopg2.connect(DATABASE_URL, sslmode=os.getenv("PGSSLMODE", "require"))
+        try:
+            cur = conn.cursor()
+            # Execute each statement separately to keep it simple across drivers
+            for stmt in POSTGRES_SCHEMA.strip().split(";
+
+"):
+                if stmt.strip():
+                    cur.execute(stmt)
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
     else:
         with sqlite3.connect(DB_PATH) as conn:
             conn.executescript(SQLITE_SCHEMA)
