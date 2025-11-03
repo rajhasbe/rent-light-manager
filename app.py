@@ -174,24 +174,22 @@ CREATE TABLE IF NOT EXISTS users (
 
 
 def init_db():
-    """Create tables if they don't exist.
-    Avoid using request-bound `g` so this can run at import time (gunicorn startup) without an app context.
+    """Create tables if they don't exist without requiring a Flask app context.
+    Uses a direct driver connection at import time so Gunicorn startup succeeds.
     """
     if using_postgres():
         if psycopg2 is None:
-            raise RuntimeError("psycopg2 is required for PostgreSQL but not installed. pip install psycopg2-binary")
-        # Use a direct psycopg2 connection instead of get_db()/g
+            raise RuntimeError(
+                "psycopg2 is required for PostgreSQL but not installed. pip install psycopg2-binary"
+            )
         conn = psycopg2.connect(DATABASE_URL, sslmode=os.getenv("PGSSLMODE", "require"))
         try:
             cur = conn.cursor()
-            # Execute each statement separately to keep it simple across drivers
-           for stmt in POSTGRES_SCHEMA.strip().split(";\n\n"):
-   		if stmt.strip():
-       			cur.execute(stmt)
+            statements = [s.strip() for s in POSTGRES_SCHEMA.strip().split(";
 
-"):
-                if stmt.strip():
-                    cur.execute(stmt)
+") if s.strip()]
+            for stmt in statements:
+                cur.execute(stmt)
             conn.commit()
         finally:
             try:
@@ -696,7 +694,7 @@ def reports():
         <div class=\"toolbar\">
           <a class=\"button ghost\" href=\"{{ url_for('dashboard') }}\">🏠 Dashboard</a>
           <a class=\"button ghost\" href=\"{{ url_for('bills_list', month=request.args.get('month'), year=request.args.get('year')) }}\">🧾 Bills</a>
-          <a class=\"button\" href=\"{{ url_for('export_csv', month=request.args.get('month'), year=request.args.get('year')) }}\"⬇️ Export CSV</a>
+          <a class=\"button\" href=\"{{ url_for('export_csv', month=request.args.get('month'), year=request.args.get('year')) }}\">⬇️ Export CSV</a>
         </div>
         <h2>Reports — {{ scope }}</h2>
         <form method=\"get\" class=\"row\">
