@@ -185,7 +185,9 @@ def init_db():
         try:
             cur = conn.cursor()
             # Execute each statement separately to keep it simple across drivers
-            for stmt in POSTGRES_SCHEMA.strip().split(";
+           for stmt in POSTGRES_SCHEMA.strip().split(";\n\n"):
+   		if stmt.strip():
+       			cur.execute(stmt)
 
 "):
                 if stmt.strip():
