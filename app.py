@@ -1,20 +1,20 @@
 """
-Simple Rent & Light Bill Manager — Flask + SQLite/PostgreSQL
------------------------------------------------------------
-One-file Flask app with a pluggable database layer:
-- Uses **SQLite** locally (default)
-- Automatically switches to **PostgreSQL** if `DATABASE_URL` is set (for cloud hosting on Render, etc.)
+Simple Rent & Light Bill Manager — Flask + SQLite/PostgreSQL (Render-ready)
 
 Run locally:
-  1) pip install -r requirements.txt   (or at least: pip install flask)
-  2) python app.py
-  3) Open http://127.0.0.1:5000
+  pip install -r requirements.txt
+  python app.py
+  Open http://127.0.0.1:5000
 
-On Render (cloud):
-  - Add `DATABASE_URL` (from Render PostgreSQL) and `SECRET_KEY` env vars
-  - Use `gunicorn app:app` as start command
+Deploy on Render:
+  - Web Service: Build Command -> pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+  - Start Command -> gunicorn app:app
+  - Env Vars:
+      DATABASE_URL = (Render Postgres Internal URL)
+      SECRET_KEY   = (any long random string)
 
-This is an MVP — secure it before using on the open internet. For local use, it's fine.
+Security notes:
+  - This is an MVP. Keep /download_receipt protected unless you want public links.
 """
 
 import os
@@ -36,63 +36,89 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# Optional: Postgres driver (only used if DATABASE_URL is present)
+# --------- Optional Postgres drivers (use psycopg2-binary OR psycopg v3) ----------
+psycopg2 = None
+psycopg = None
+psycopg_rows = None
 try:
-    import psycopg2
-    import psycopg2.extras
-except Exception:  # pragma: no cover
-    psycopg2 = None  # type: ignore
+    import psycopg2  # type: ignore
+    import psycopg2.extras  # type: ignore
+except Exception:
+    psycopg2 = None
+
+if psycopg2 is None:
+    try:
+        import psycopg  # type: ignore  # psycopg v3
+        from psycopg import rows as psycopg_rows  # type: ignore
+    except Exception:
+        psycopg = None
+        psycopg_rows = None
 
 APP_TITLE = "Rent & Light Bill Manager"
 DB_PATH = Path("rent_manager.db")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "change-this-in-production")  # required for sessions
+app.secret_key = os.getenv("SECRET_KEY", "change-this-in-production")
 
-# --------------------- Lightweight DB Abstraction ---------------------
+
+# --------------------- Helpers: DB selection & wrappers ---------------------
+
+def using_postgres() -> bool:
+    return bool(DATABASE_URL and DATABASE_URL.startswith("postgres"))
+
 
 class PGResult:
     def __init__(self, cur):
         self.cur = cur
     def fetchall(self):
-        rows = self.cur.fetchall()
-        return rows
+        return self.cur.fetchall()
     def fetchone(self):
         return self.cur.fetchone()
 
+
 class PGConn:
-    def __init__(self, conn):
-        self._conn = conn
-    def execute(self, query: str, params: Iterable[Any] = ()):  # mimic sqlite3 Connection API
-        q = query.replace("?", "%s")  # basic placeholder swap
-        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    def __init__(self, raw_conn, driver="psycopg2"):
+        self._conn = raw_conn
+        self._driver = driver
+
+    def execute(self, query: str, params: Iterable[Any] = ()):
+        q = query.replace("?", "%s")  # sqlite-style -> postgres-style placeholders
+        if self._driver == "psycopg2":
+            cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)  # type: ignore
+        else:
+            cur = self._conn.cursor(row_factory=psycopg_rows.dict_row)  # type: ignore
         cur.execute(q, params)
         return PGResult(cur)
+
     def commit(self):
         self._conn.commit()
+
     def close(self):
         self._conn.close()
-
-
-def using_postgres() -> bool:
-    return bool(DATABASE_URL and DATABASE_URL.startswith("postgres"))
 
 
 def get_db():
     if "db" in g:
         return g.db
     if using_postgres():
-        if psycopg2 is None:
-            raise RuntimeError("psycopg2 is required for PostgreSQL but not installed. pip install psycopg2-binary")
-        conn = psycopg2.connect(DATABASE_URL, sslmode=os.getenv("PGSSLMODE", "require"))
-        g.db = PGConn(conn)
-        return g.db
+        # Prefer psycopg2; fallback to psycopg v3
+        if psycopg2 is not None:
+            conn = psycopg2.connect(DATABASE_URL, sslmode=os.getenv("PGSSLMODE", "require"))  # type: ignore
+            g.db = PGConn(conn, driver="psycopg2")
+            return g.db
+        elif psycopg is not None:
+            conn = psycopg.connect(DATABASE_URL, sslmode=os.getenv("PGSSLMODE", "require"))  # type: ignore
+            g.db = PGConn(conn, driver="psycopg")
+            return g.db
+        else:
+            raise RuntimeError("No PostgreSQL driver available. Install 'psycopg2-binary' or 'psycopg'.")
     # default sqlite
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     g.db = conn
     return g.db
+
 
 @app.teardown_appcontext
 def close_db(exception=None):
@@ -103,7 +129,8 @@ def close_db(exception=None):
         except Exception:
             pass
 
-# --------------------- Schema (SQLite vs Postgres) ---------------------
+
+# --------------------- Schema ---------------------
 
 SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS tenants (
@@ -175,31 +202,34 @@ CREATE TABLE IF NOT EXISTS users (
 
 def init_db():
     """
-    Create database tables if they don't exist.
-    Works for both PostgreSQL (production) and SQLite (local testing).
-    Avoids Flask app context issues by using direct connections.
+    Create DB tables at import/startup without requiring a Flask app context.
     """
     if using_postgres():
-        if psycopg2 is None:
-            raise RuntimeError(
-                "psycopg2 is required for PostgreSQL but not installed. "
-                "Run 'pip install psycopg2-binary'"
-            )
-        conn = psycopg2.connect(DATABASE_URL, sslmode=os.getenv("PGSSLMODE", "require"))
-        try:
-            cur = conn.cursor()
-            # Split schema safely by double newlines after semicolons
-            statements = [s.strip() for s in POSTGRES_SCHEMA.strip().split(";\n\n") if s.strip()]
-            for stmt in statements:
-                cur.execute(stmt)
-            conn.commit()
-        finally:
+        statements = [s.strip() for s in POSTGRES_SCHEMA.strip().split(";\n\n") if s.strip()]
+        # Prefer psycopg2; fallback to psycopg v3
+        if psycopg2 is not None:
+            conn = psycopg2.connect(DATABASE_URL, sslmode=os.getenv("PGSSLMODE", "require"))  # type: ignore
             try:
-                conn.close()
-            except Exception:
-                pass
+                cur = conn.cursor()
+                for stmt in statements:
+                    cur.execute(stmt)
+                conn.commit()
+            finally:
+                try: conn.close()
+                except Exception: pass
+        elif psycopg is not None:
+            conn = psycopg.connect(DATABASE_URL, sslmode=os.getenv("PGSSLMODE", "require"))  # type: ignore
+            try:
+                with conn.cursor() as cur:
+                    for stmt in statements:
+                        cur.execute(stmt)
+                conn.commit()
+            finally:
+                try: conn.close()
+                except Exception: pass
+        else:
+            raise RuntimeError("No PostgreSQL driver available. Install 'psycopg2-binary' or 'psycopg'.")
     else:
-        # SQLite fallback for local testing
         with sqlite3.connect(DB_PATH) as conn:
             conn.executescript(SQLITE_SCHEMA)
 
@@ -212,13 +242,13 @@ init_db()
 
 BASE_HTML = """
 <!doctype html>
-<html lang=\"en\">
+<html lang="en">
 <head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }}</title>
   <style>
-    body{font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; margin:0; background:#f7f7fb; color:#111}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; margin:0; background:#f7f7fb; color:#111}
     header{background:#222; color:#fff; padding:16px 20px;}
     header h1{margin:0; font-size:20px}
     main{max-width:980px; margin:24px auto; background:#fff; padding:20px; border-radius:14px; box-shadow:0 4px 12px rgba(0,0,0,.06)}
@@ -238,21 +268,21 @@ BASE_HTML = """
   </style>
 </head>
 <body>
-  <header style=\"display:flex; align-items:center; justify-content:space-between\">
+  <header style="display:flex; align-items:center; justify-content:space-between">
     <h1>{{ app_title }}</h1>
     <div>
       {% if session.get('user_id') %}
-        <span style=\"margin-right:10px\">👤 {{ session.get('username') }}</span>
-        <a class=\"button ghost\" href=\"{{ url_for('logout') }}\">Logout</a>
+        <span style="margin-right:10px">👤 {{ session.get('username') }}</span>
+        <a class="button ghost" href="{{ url_for('logout') }}">Logout</a>
       {% else %}
-        <a class=\"button ghost\" href=\"{{ url_for('login') }}\">Login</a>
+        <a class="button ghost" href="{{ url_for('login') }}">Login</a>
       {% endif %}
     </div>
   </header>
   <main>
     {% with messages = get_flashed_messages() %}
       {% if messages %}
-        {% for m in messages %}<div class=\"flash\">{{ m }}</div>{% endfor %}
+        {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
       {% endif %}
     {% endwith %}
     {{ body|safe }}
@@ -261,6 +291,7 @@ BASE_HTML = """
 </html>
 """
 
+
 # --------------------- Auth ---------------------
 
 @app.before_request
@@ -268,13 +299,14 @@ def require_login():
     open_endpoints = {"login", "auth_init", "static", "health"}
     if request.endpoint in open_endpoints:
         return
-    # If you want to allow public receipts, uncomment below
+    # To allow public receipts, uncomment the next 2 lines:
     # if request.endpoint == "download_receipt":
     #     return
     if not session.get("user_id") and request.path not in ("/login", "/auth/init", "/health"):
         return redirect(url_for("login"))
 
-@app.route("/auth/init", methods=["GET","POST"])
+
+@app.route("/auth/init", methods=["GET", "POST"])
 def auth_init():
     db = get_db()
     user = db.execute("SELECT id FROM users LIMIT 1").fetchone()
@@ -297,16 +329,17 @@ def auth_init():
         """
         <h2>Initialize Admin</h2>
         <p>No users found. Create the first admin account.</p>
-        <form method=\"post\">
-          <div class=\"group\"><label>Username</label><input name=\"username\" required></div>
-          <div class=\"group\"><label>Password</label><input type=\"password\" name=\"password\" required></div>
-          <input type=\"submit\" value=\"Create Admin\">
+        <form method="post">
+          <div class="group"><label>Username</label><input name="username" required></div>
+          <div class="group"><label>Password</label><input type="password" name="password" required></div>
+          <input type="submit" value="Create Admin">
         </form>
         """
     )
-    return render_template_string(BASE_HTML, title="Init | "+APP_TITLE, app_title=APP_TITLE, body=body)
+    return render_template_string(BASE_HTML, title="Init | " + APP_TITLE, app_title=APP_TITLE, body=body)
 
-@app.route("/login", methods=["GET","POST"])
+
+@app.route("/login", methods=["GET", "POST"])
 def login():
     db = get_db()
     if request.method == "POST":
@@ -323,15 +356,16 @@ def login():
     body = render_template_string(
         """
         <h2>Login</h2>
-        <form method=\"post\">
-          <div class=\"group\"><label>Username</label><input name=\"username\" required></div>
-          <div class=\"group\"><label>Password</label><input type=\"password\" name=\"password\" required></div>
-          <input type=\"submit\" value=\"Login\">
+        <form method="post">
+          <div class="group"><label>Username</label><input name="username" required></div>
+          <div class="group"><label>Password</label><input type="password" name="password" required></div>
+          <input type="submit" value="Login">
         </form>
-        <p style=\"margin-top:10px;color:#555\">First time? If you haven't created a user yet, go to <a href=\"{{ url_for('auth_init') }}\">Initialize Admin</a>.</p>
+        <p style="margin-top:10px;color:#555">First time? Go to <a href="{{ url_for('auth_init') }}">Initialize Admin</a>.</p>
         """
     )
-    return render_template_string(BASE_HTML, title="Login | "+APP_TITLE, app_title=APP_TITLE, body=body)
+    return render_template_string(BASE_HTML, title="Login | " + APP_TITLE, app_title=APP_TITLE, body=body)
+
 
 @app.route("/logout")
 def logout():
@@ -339,11 +373,13 @@ def logout():
     flash("You have been logged out.")
     return redirect(url_for("login"))
 
+
 @app.route("/health")
 def health():
     return {"status": "ok", "app": APP_TITLE}
 
-# --------------------- Routes ---------------------
+
+# --------------------- Core UI ---------------------
 
 @app.route("/")
 def dashboard():
@@ -357,24 +393,24 @@ def dashboard():
 
     body = render_template_string(
         """
-        <div class=\"toolbar\">
-          <a class=\"button\" href=\"{{ url_for('new_tenant') }}\">➕ Add Tenant</a>
-          <a class=\"button ghost\" href=\"{{ url_for('tenants_list') }}\">👥 Tenants</a>
-          <a class=\"button ghost\" href=\"{{ url_for('bills_list') }}\">🧾 Bills</a>
-          <a class=\"button ghost\" href=\"{{ url_for('reports') }}\">📊 Reports</a>
-          <a class=\"button ghost\" href=\"{{ url_for('new_reading') }}\">⚡ New Reading</a>
+        <div class="toolbar">
+          <a class="button" href="{{ url_for('new_tenant') }}">➕ Add Tenant</a>
+          <a class="button ghost" href="{{ url_for('tenants_list') }}">👥 Tenants</a>
+          <a class="button ghost" href="{{ url_for('bills_list') }}">🧾 Bills</a>
+          <a class="button ghost" href="{{ url_for('reports') }}">📊 Reports</a>
+          <a class="button ghost" href="{{ url_for('new_reading') }}">⚡ New Reading</a>
         </div>
 
-        <div class=\"row\" style=\"margin-top:12px\">
-          <div class=\"card\">
+        <div class="row" style="margin-top:12px">
+          <div class="card">
             <div><strong>Total tenants</strong></div>
-            <div style=\"font-size:28px\">{{ tenants|length }}</div>
+            <div style="font-size:28px">{{ tenants|length }}</div>
           </div>
-          <div class=\"card\">
+          <div class="card">
             <div><strong>Unpaid bills</strong></div>
-            <div style=\"font-size:28px\">{{ unpaid|length }}</div>
+            <div style="font-size:28px">{{ unpaid|length }}</div>
           </div>
-          <div class=\"card\">
+          <div class="card">
             <div><strong>Current cycle</strong></div>
             <div>{{ this_month }}/{{ this_year }}</div>
           </div>
@@ -393,10 +429,10 @@ def dashboard():
             <td>{{ b['units'] }}</td>
             <td>₹{{ '%.0f' % b['light_bill'] }}</td>
             <td><strong>₹{{ '%.0f' % b['total'] }}</strong></td>
-            <td class=\"bad\">Unpaid</td>
+            <td class="{{ 'bad' if not b['paid'] else 'ok' }}">{{ 'Unpaid' if not b['paid'] else 'Paid' }}</td>
             <td>
-              <form method=\"post\" action=\"{{ url_for('mark_paid', bill_id=b['id']) }}\">
-                <input type=\"submit\" value=\"Mark Paid\">
+              <form method="post" action="{{ url_for('mark_paid', bill_id=b['id']) }}">
+                <input type="submit" value="Mark Paid">
               </form>
             </td>
           </tr>
@@ -408,8 +444,8 @@ def dashboard():
         this_month=this_month,
         this_year=this_year,
     )
-
     return render_template_string(BASE_HTML, title=APP_TITLE, app_title=APP_TITLE, body=body)
+
 
 @app.route("/tenants")
 def tenants_list():
@@ -417,9 +453,9 @@ def tenants_list():
     tenants = db.execute("SELECT * FROM tenants ORDER BY name").fetchall()
     body = render_template_string(
         """
-        <div class=\"toolbar\">
-          <a class=\"button\" href=\"{{ url_for('new_tenant') }}\">➕ Add Tenant</a>
-          <a class=\"button ghost\" href=\"{{ url_for('dashboard') }}\">🏠 Dashboard</a>
+        <div class="toolbar">
+          <a class="button" href="{{ url_for('new_tenant') }}">➕ Add Tenant</a>
+          <a class="button ghost" href="{{ url_for('dashboard') }}">🏠 Dashboard</a>
         </div>
         <h2>Tenants</h2>
         <table>
@@ -427,16 +463,17 @@ def tenants_list():
           {% for t in tenants %}
           <tr>
             <td>{{ t['name'] }}</td><td>{{ t['room'] or '-' }}</td><td>{{ t['monthly_rent'] }}</td><td>{{ '%.2f' % t['rate_per_unit'] }}</td><td>{{ t['last_reading'] }}</td>
-            <td><a class=\"button ghost\" href=\"{{ url_for('edit_tenant', tenant_id=t['id']) }}\">Edit</a></td>
+            <td><a class="button ghost" href="{{ url_for('edit_tenant', tenant_id=t['id']) }}">Edit</a></td>
           </tr>
           {% endfor %}
         </table>
         """,
         tenants=tenants,
     )
-    return render_template_string(BASE_HTML, title="Tenants | "+APP_TITLE, app_title=APP_TITLE, body=body)
+    return render_template_string(BASE_HTML, title="Tenants | " + APP_TITLE, app_title=APP_TITLE, body=body)
 
-@app.route("/tenant/new", methods=["GET","POST"])
+
+@app.route("/tenant/new", methods=["GET", "POST"])
 def new_tenant():
     if request.method == "POST":
         name = request.form.get("name", "").strip()
@@ -457,23 +494,24 @@ def new_tenant():
             return redirect(url_for("tenants_list"))
     body = render_template_string(
         """
-        <div class=\"toolbar\">
-          <a class=\"button ghost\" href=\"{{ url_for('tenants_list') }}\">← Back</a>
+        <div class="toolbar">
+          <a class="button ghost" href="{{ url_for('tenants_list') }}">← Back</a>
         </div>
         <h2>New Tenant</h2>
-        <form method=\"post\">
-          <div class=\"group\"><label>Name</label><input name=\"name\" required></div>
-          <div class=\"group\"><label>Room</label><input name=\"room\"></div>
-          <div class=\"group\"><label>Monthly Rent (₹)</label><input name=\"monthly_rent\" type=\"number\" required></div>
-          <div class=\"group\"><label>Rate per Unit (₹)</label><input name=\"rate_per_unit\" type=\"number\" step=\"0.01\" value=\"8\"></div>
-          <div class=\"group\"><label>Initial Meter Reading</label><input name=\"last_reading\" type=\"number\" value=\"0\"></div>
-          <input type=\"submit\" value=\"Save\">
+        <form method="post">
+          <div class="group"><label>Name</label><input name="name" required></div>
+          <div class="group"><label>Room</label><input name="room"></div>
+          <div class="group"><label>Monthly Rent (₹)</label><input name="monthly_rent" type="number" required></div>
+          <div class="group"><label>Rate per Unit (₹)</label><input name="rate_per_unit" type="number" step="0.01" value="8"></div>
+          <div class="group"><label>Initial Meter Reading</label><input name="last_reading" type="number" value="0"></div>
+          <input type="submit" value="Save">
         </form>
         """
     )
-    return render_template_string(BASE_HTML, title="New Tenant | "+APP_TITLE, app_title=APP_TITLE, body=body)
+    return render_template_string(BASE_HTML, title="New Tenant | " + APP_TITLE, app_title=APP_TITLE, body=body)
 
-@app.route("/tenant/<int:tenant_id>/edit", methods=["GET","POST"])
+
+@app.route("/tenant/<int:tenant_id>/edit", methods=["GET", "POST"])
 def edit_tenant(tenant_id):
     db = get_db()
     tenant = db.execute("SELECT * FROM tenants WHERE id=?", (tenant_id,)).fetchone()
@@ -495,24 +533,25 @@ def edit_tenant(tenant_id):
         return redirect(url_for("tenants_list"))
     body = render_template_string(
         """
-        <div class=\"toolbar\">
-          <a class=\"button ghost\" href=\"{{ url_for('tenants_list') }}\">← Back</a>
+        <div class="toolbar">
+          <a class="button ghost" href="{{ url_for('tenants_list') }}">← Back</a>
         </div>
         <h2>Edit Tenant</h2>
-        <form method=\"post\">
-          <div class=\"group\"><label>Name</label><input name=\"name\" value=\"{{ t['name'] }}\" required></div>
-          <div class=\"group\"><label>Room</label><input name=\"room\" value=\"{{ t['room'] }}\"></div>
-          <div class=\"group\"><label>Monthly Rent (₹)</label><input name=\"monthly_rent\" type=\"number\" value=\"{{ t['monthly_rent'] }}\" required></div>
-          <div class=\"group\"><label>Rate per Unit (₹)</label><input name=\"rate_per_unit\" type=\"number\" step=\"0.01\" value=\"{{ t['rate_per_unit'] }}\"></div>
-          <div class=\"group\"><label>Last Meter Reading</label><input name=\"last_reading\" type=\"number\" value=\"{{ t['last_reading'] }}\"></div>
-          <input type=\"submit\" value=\"Save Changes\">
+        <form method="post">
+          <div class="group"><label>Name</label><input name="name" value="{{ t['name'] }}" required></div>
+          <div class="group"><label>Room</label><input name="room" value="{{ t['room'] }}"></div>
+          <div class="group"><label>Monthly Rent (₹)</label><input name="monthly_rent" type="number" value="{{ t['monthly_rent'] }}" required></div>
+          <div class="group"><label>Rate per Unit (₹)</label><input name="rate_per_unit" type="number" step="0.01" value="{{ t['rate_per_unit'] }}"></div>
+          <div class="group"><label>Last Meter Reading</label><input name="last_reading" type="number" value="{{ t['last_reading'] }}"></div>
+          <input type="submit" value="Save Changes">
         </form>
         """,
         t=tenant,
     )
-    return render_template_string(BASE_HTML, title="Edit Tenant | "+APP_TITLE, app_title=APP_TITLE, body=body)
+    return render_template_string(BASE_HTML, title="Edit Tenant | " + APP_TITLE, app_title=APP_TITLE, body=body)
 
-@app.route("/reading/new", methods=["GET","POST"])
+
+@app.route("/reading/new", methods=["GET", "POST"])
 def new_reading():
     db = get_db()
     tenants = db.execute("SELECT * FROM tenants ORDER BY name").fetchall()
@@ -534,23 +573,14 @@ def new_reading():
         light_bill = round(units * float(tenant["rate_per_unit"]), 2)
         total = float(tenant["monthly_rent"]) + light_bill
 
-        # create bill
         db.execute(
             "INSERT INTO bills (tenant_id, month, year, start_reading, end_reading, units, light_bill, total, paid, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
-                tenant_id,
-                month,
-                year,
-                start_reading,
-                end_reading,
-                units,
-                light_bill,
-                total,
-                0,
-                datetime.now().isoformat(),
+                tenant_id, month, year,
+                start_reading, end_reading, units,
+                light_bill, total, 0, datetime.now().isoformat(),
             ),
         )
-        # update last_reading
         db.execute("UPDATE tenants SET last_reading=? WHERE id=?", (end_reading, tenant_id))
         db.commit()
         flash(f"Bill created: Units {units}, Light ₹{light_bill:.0f}, Total ₹{total:.0f}")
@@ -558,37 +588,38 @@ def new_reading():
 
     body = render_template_string(
         """
-        <div class=\"toolbar\">
-          <a class=\"button ghost\" href=\"{{ url_for('dashboard') }}\">← Back</a>
+        <div class="toolbar">
+          <a class="button ghost" href="{{ url_for('dashboard') }}">← Back</a>
         </div>
         <h2>New Meter Reading / Create Bill</h2>
-        <form method=\"post\">
-          <div class=\"group\">
+        <form method="post">
+          <div class="group">
             <label>Tenant</label>
-            <select name=\"tenant_id\" required>
+            <select name="tenant_id" required>
               {% for t in tenants %}
-                <option value=\"{{ t['id'] }}\">{{ t['name'] }} (Room {{ t['room'] or '-' }}) — Last {{ t['last_reading'] }} / Rate ₹{{ '%.2f' % t['rate_per_unit'] }}</option>
+                <option value="{{ t['id'] }}">{{ t['name'] }} (Room {{ t['room'] or '-' }}) — Last {{ t['last_reading'] }} / Rate ₹{{ '%.2f' % t['rate_per_unit'] }}</option>
               {% endfor %}
             </select>
           </div>
-          <div class=\"row\">
-            <div class=\"group\" style=\"flex:1\">
+          <div class="row">
+            <div class="group" style="flex:1">
               <label>Month</label>
-              <input type=\"number\" name=\"month\" min=\"1\" max=\"12\" value=\"{{ now.month }}\">
+              <input type="number" name="month" min="1" max="12" value="{{ now.month }}">
             </div>
-            <div class=\"group\" style=\"flex:1\">
+            <div class="group" style="flex:1">
               <label>Year</label>
-              <input type=\"number\" name=\"year\" value=\"{{ now.year }}\">
+              <input type="number" name="year" value="{{ now.year }}">
             </div>
           </div>
-          <div class=\"group\"><label>Current Meter Reading (end)</label><input type=\"number\" name=\"end_reading\" required></div>
-          <input type=\"submit\" value=\"Create Bill\">
+          <div class="group"><label>Current Meter Reading (end)</label><input type="number" name="end_reading" required></div>
+          <input type="submit" value="Create Bill">
         </form>
         """,
         tenants=tenants,
         now=datetime.now(),
     )
-    return render_template_string(BASE_HTML, title="New Reading | "+APP_TITLE, app_title=APP_TITLE, body=body)
+    return render_template_string(BASE_HTML, title="New Reading | " + APP_TITLE, app_title=APP_TITLE, body=body)
+
 
 @app.route("/bills")
 def bills_list():
@@ -603,7 +634,7 @@ def bills_list():
     if year:
         where.append("year=?")
         params.append(int(year))
-    where_sql = (" WHERE "+" AND ".join(where)) if where else ""
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
     bills = db.execute(
         f"SELECT b.*, t.name, t.room FROM bills b JOIN tenants t ON t.id=b.tenant_id {where_sql} ORDER BY year DESC, month DESC, id DESC",
         params,
@@ -611,17 +642,17 @@ def bills_list():
 
     body = render_template_string(
         """
-        <div class=\"toolbar\">
-          <a class=\"button ghost\" href=\"{{ url_for('dashboard') }}\">🏠 Dashboard</a>
-          <a class=\"button ghost\" href=\"{{ url_for('new_reading') }}\">⚡ New Reading</a>
-          <a class=\"button\" href=\"{{ url_for('reports', month=request.args.get('month'), year=request.args.get('year')) }}\">📊 Reports</a>
+        <div class="toolbar">
+          <a class="button ghost" href="{{ url_for('dashboard') }}">🏠 Dashboard</a>
+          <a class="button ghost" href="{{ url_for('new_reading') }}">⚡ New Reading</a>
+          <a class="button" href="{{ url_for('reports', month=request.args.get('month'), year=request.args.get('year')) }}">📊 Reports</a>
         </div>
         <h2>Bills</h2>
-        <form method=\"get\" class=\"row\">
-          <input name=\"month\" placeholder=\"Month (1-12)\" value=\"{{ request.args.get('month','') }}\" style=\"max-width:160px\">
-          <input name=\"year\" placeholder=\"Year (e.g. 2025)\" value=\"{{ request.args.get('year','') }}\" style=\"max-width:160px\">
-          <input type=\"submit\" value=\"Filter\">
-          <a class=\"button ghost\" href=\"{{ url_for('bills_list') }}\">Clear</a>
+        <form method="get" class="row">
+          <input name="month" placeholder="Month (1-12)" value="{{ request.args.get('month','') }}" style="max-width:160px">
+          <input name="year" placeholder="Year (e.g. 2025)" value="{{ request.args.get('year','') }}" style="max-width:160px">
+          <input type="submit" value="Filter">
+          <a class="button ghost" href="{{ url_for('bills_list') }}">Clear</a>
         </form>
         <table>
           <tr>
@@ -637,14 +668,14 @@ def bills_list():
             <td>{{ b['units'] }}</td>
             <td>{{ '%.0f' % b['light_bill'] }}</td>
             <td><strong>{{ '%.0f' % b['total'] }}</strong></td>
-            <td class=\"{{ 'ok' if b['paid'] else 'bad' }}\">{{ 'Paid' if b['paid'] else 'Unpaid' }}</td>
+            <td class="{{ 'ok' if b['paid'] else 'bad' }}">{{ 'Paid' if b['paid'] else 'Unpaid' }}</td>
             <td>
               {% if not b['paid'] %}
-              <form style=\"display:inline\" method=\"post\" action=\"{{ url_for('mark_paid', bill_id=b['id']) }}\">
-                <input type=\"submit\" value=\"Mark Paid\">
+              <form style="display:inline" method="post" action="{{ url_for('mark_paid', bill_id=b['id']) }}">
+                <input type="submit" value="Mark Paid">
               </form>
               {% endif %}
-              <a class=\"button ghost\" href=\"{{ url_for('download_receipt', bill_id=b['id']) }}\">Receipt</a>
+              <a class="button ghost" href="{{ url_for('download_receipt', bill_id=b['id']) }}">Receipt</a>
             </td>
           </tr>
           {% endfor %}
@@ -652,9 +683,10 @@ def bills_list():
         """,
         bills=bills,
     )
-    return render_template_string(BASE_HTML, title="Bills | "+APP_TITLE, app_title=APP_TITLE, body=body)
+    return render_template_string(BASE_HTML, title="Bills | " + APP_TITLE, app_title=APP_TITLE, body=body)
 
-# --------------------- Reports ---------------------
+
+# --------------------- Reports & Export ---------------------
 
 @app.route("/reports")
 def reports():
@@ -662,8 +694,7 @@ def reports():
     month = request.args.get("month")
     year = request.args.get("year")
 
-    filters = []
-    params = []
+    filters, params = [], []
     scope_label = "All Time"
     if year and year.isdigit():
         filters.append("year=?")
@@ -674,18 +705,14 @@ def reports():
         params.append(int(month))
         scope_label = f"{int(month):02d}/{year}" if year else f"Month {month}"
 
-    where_sql = (" WHERE "+" AND ".join(filters)) if filters else ""
-
+    where_sql = (" WHERE " + " AND ".join(filters)) if filters else ""
     rows = db.execute(
         f"SELECT b.*, t.name, t.room FROM bills b JOIN tenants t ON t.id=b.tenant_id {where_sql} ORDER BY year DESC, month DESC, id DESC",
         params,
     ).fetchall()
 
-    # Aggregates
-    # NOTE: For Postgres rows are dicts; for SQLite rows behave like dict via Row mapping
     total_units = sum(r["units"] for r in rows) if rows else 0
     total_light = sum(float(r["light_bill"]) for r in rows) if rows else 0.0
-    # monthly_rent per bill's tenant at the time of bill — approximated from current tenant rent
     total_rent = 0.0
     for r in rows:
         rent_row = db.execute("SELECT monthly_rent FROM tenants WHERE id=?", (r["tenant_id"],)).fetchone()
@@ -696,26 +723,26 @@ def reports():
 
     body = render_template_string(
         """
-        <div class=\"toolbar\">
-          <a class=\"button ghost\" href=\"{{ url_for('dashboard') }}\">🏠 Dashboard</a>
-          <a class=\"button ghost\" href=\"{{ url_for('bills_list', month=request.args.get('month'), year=request.args.get('year')) }}\">🧾 Bills</a>
-          <a class=\"button\" href=\"{{ url_for('export_csv', month=request.args.get('month'), year=request.args.get('year')) }}\">⬇️ Export CSV</a>
+        <div class="toolbar">
+          <a class="button ghost" href="{{ url_for('dashboard') }}">🏠 Dashboard</a>
+          <a class="button ghost" href="{{ url_for('bills_list', month=request.args.get('month'), year=request.args.get('year')) }}">🧾 Bills</a>
+          <a class="button" href="{{ url_for('export_csv', month=request.args.get('month'), year=request.args.get('year')) }}">⬇️ Export CSV</a>
         </div>
         <h2>Reports — {{ scope }}</h2>
-        <form method=\"get\" class=\"row\">
-          <input name=\"month\" placeholder=\"Month (1-12)\" value=\"{{ request.args.get('month','') }}\" style=\"max-width:160px\">
-          <input name=\"year\" placeholder=\"Year (e.g. 2025)\" value=\"{{ request.args.get('year','') }}\" style=\"max-width:160px\">
-          <input type=\"submit\" value=\"Filter\">
-          <a class=\"button ghost\" href=\"{{ url_for('reports') }}\">Clear</a>
+        <form method="get" class="row">
+          <input name="month" placeholder="Month (1-12)" value="{{ request.args.get('month','') }}" style="max-width:160px">
+          <input name="year" placeholder="Year (e.g. 2025)" value="{{ request.args.get('year','') }}" style="max-width:160px">
+          <input type="submit" value="Filter">
+          <a class="button ghost" href="{{ url_for('reports') }}">Clear</a>
         </form>
 
-        <div class=\"row\" style=\"margin-top:12px\">
-          <div class=\"card\"><div><strong>Total Units</strong></div><div style=\"font-size:24px\">{{ total_units }}</div></div>
-          <div class=\"card\"><div><strong>Light Bill</strong></div><div style=\"font-size:24px\">₹{{ '%.0f' % total_light }}</div></div>
-          <div class=\"card\"><div><strong>Rent</strong></div><div style=\"font-size:24px\">₹{{ '%.0f' % total_rent }}</div></div>
-          <div class=\"card\"><div><strong>Grand Total</strong></div><div style=\"font-size:24px\">₹{{ '%.0f' % grand_total }}</div></div>
-          <div class=\"card\"><div><strong>Received</strong></div><div style=\"font-size:24px\" class=\"ok\">₹{{ '%.0f' % received }}</div></div>
-          <div class=\"card\"><div><strong>Outstanding</strong></div><div style=\"font-size:24px\" class=\"bad\">₹{{ '%.0f' % outstanding }}</div></div>
+        <div class="row" style="margin-top:12px">
+          <div class="card"><div><strong>Total Units</strong></div><div style="font-size:24px">{{ total_units }}</div></div>
+          <div class="card"><div><strong>Light Bill</strong></div><div style="font-size:24px">₹{{ '%.0f' % total_light }}</div></div>
+          <div class="card"><div><strong>Rent</strong></div><div style="font-size:24px">₹{{ '%.0f' % total_rent }}</div></div>
+          <div class="card"><div><strong>Grand Total</strong></div><div style="font-size:24px">₹{{ '%.0f' % grand_total }}</div></div>
+          <div class="card"><div><strong>Received</strong></div><div style="font-size:24px" class="ok">₹{{ '%.0f' % received }}</div></div>
+          <div class="card"><div><strong>Outstanding</strong></div><div style="font-size:24px" class="bad">₹{{ '%.0f' % outstanding }}</div></div>
         </div>
 
         <h3>Bill Details</h3>
@@ -731,7 +758,7 @@ def reports():
             <td>{{ r['units'] }}</td>
             <td>{{ '%.0f' % r['light_bill'] }}</td>
             <td><strong>{{ '%.0f' % r['total'] }}</strong></td>
-            <td class=\"{{ 'ok' if r['paid'] else 'bad' }}\">{{ 'Paid' if r['paid'] else 'Unpaid' }}</td>
+            <td class="{{ 'ok' if r['paid'] else 'bad' }}">{{ 'Paid' if r['paid'] else 'Unpaid' }}</td>
           </tr>
           {% endfor %}
         </table>
@@ -745,7 +772,8 @@ def reports():
         received=received,
         outstanding=outstanding,
     )
-    return render_template_string(BASE_HTML, title="Reports | "+APP_TITLE, app_title=APP_TITLE, body=body)
+    return render_template_string(BASE_HTML, title="Reports | " + APP_TITLE, app_title=APP_TITLE, body=body)
+
 
 @app.route("/reports/export")
 def export_csv():
@@ -768,33 +796,37 @@ def export_csv():
         else:
             fname = f"reports_month_{month}.csv"
 
-    where_sql = (" WHERE "+" AND ".join(filters)) if filters else ""
-
+    where_sql = (" WHERE " + " AND ".join(filters)) if filters else ""
     rows = db.execute(
-        f"SELECT b.id, t.name, t.room, b.month, b.year, b.start_reading, b.end_reading, b.units, b.light_bill, b.total, b.paid FROM bills b JOIN tenants t ON t.id=b.tenant_id {where_sql} ORDER BY year DESC, month DESC, b.id DESC",
+        f"SELECT b.id, t.name, t.room, b.month, b.year, b.start_reading, b.end_reading, b.units, b.light_bill, b.total, b.paid "
+        f"FROM bills b JOIN tenants t ON t.id=b.tenant_id {where_sql} ORDER BY year DESC, month DESC, b.id DESC",
         params,
     ).fetchall()
 
-    # Build CSV (Excel-compatible)
     output_lines = [
-        ["Bill ID","Tenant","Room","Month","Year","Start","End","Units","Light Bill (₹)","Total (₹)","Paid"],
+        ["Bill ID", "Tenant", "Room", "Month", "Year", "Start", "End", "Units", "Light Bill (₹)", "Total (₹)", "Paid"],
     ]
     for r in rows:
         output_lines.append([
-            r["id"], r["name"], r["room"], r["month"], r["year"], r["start_reading"], r["end_reading"], r["units"], int(round(float(r["light_bill"]))), int(round(float(r["total"]))), "Yes" if r["paid"] else "No"
+            r["id"], r["name"], r["room"], r["month"], r["year"], r["start_reading"], r["end_reading"],
+            r["units"], int(round(float(r["light_bill"]))), int(round(float(r["total"]))),
+            "Yes" if r["paid"] else "No"
         ])
 
-    # write manually to avoid extra dependency
-    csv_text = "\r\n".join(",".join(map(lambda x: f'"{str(x).replace("\"","\"\"")}"', row)) for row in output_lines)
+    csv_text = "\r\n".join(",".join(f"\"{str(x).replace('\"','\"\"')}\"" for x in row) for row in output_lines)
     return Response(csv_text, mimetype="text/csv", headers={"Content-Disposition": f"attachment; filename={fname}"})
 
-@app.route("/bill/<int:bill_id>/paid", methods=["POST"])  # FIXED: removed stray "), methods=[\"POST\"]"
+
+# --------------------- Bill actions ---------------------
+
+@app.route("/bill/<int:bill_id>/paid", methods=["POST"])
 def mark_paid(bill_id):
     db = get_db()
     db.execute("UPDATE bills SET paid=1 WHERE id=?", (bill_id,))
     db.commit()
     flash("Marked as paid.")
     return redirect(request.referrer or url_for("bills_list"))
+
 
 @app.route("/bill/<int:bill_id>/receipt")
 def download_receipt(bill_id):
@@ -808,21 +840,21 @@ def download_receipt(bill_id):
         return redirect(url_for("bills_list"))
     html = render_template_string(
         """
-        <div style=\"max-width:680px; margin:24px auto; font-family:Arial\">
+        <div style="max-width:680px; margin:24px auto; font-family:Arial">
           <h2>Rent & Electricity Receipt</h2>
           <p>Date: {{ now }}</p>
           <hr>
           <p><strong>Tenant:</strong> {{ b['name'] }} &nbsp; <strong>Room:</strong> {{ b['room'] or '-' }}</p>
           <p><strong>Month:</strong> {{ '%02d/%d' % (b['month'], b['year']) }}</p>
-          <table style=\"width:100%; border-collapse:collapse\" border=\"1\" cellpadding=\"8\">
-            <tr><th align=\"left\">Description</th><th align=\"right\">Amount (₹)</th></tr>
-            <tr><td>Rent</td><td align=\"right\">{{ '%.0f' % b['monthly_rent'] }}</td></tr>
-            <tr><td>Electricity ({{ b['units'] }} units @ ₹{{ '%.2f' % b['rate_per_unit'] }}/unit)</td><td align=\"right\">{{ '%.0f' % b['light_bill'] }}</td></tr>
-            <tr><td><strong>Total</strong></td><td align=\"right\"><strong>{{ '%.0f' % b['total'] }}</strong></td></tr>
+          <table style="width:100%; border-collapse:collapse" border="1" cellpadding="8">
+            <tr><th align="left">Description</th><th align="right">Amount (₹)</th></tr>
+            <tr><td>Rent</td><td align="right">{{ '%.0f' % b['monthly_rent'] }}</td></tr>
+            <tr><td>Electricity ({{ b['units'] }} units @ ₹{{ '%.2f' % b['rate_per_unit'] }}/unit)</td><td align="right">{{ '%.0f' % b['light_bill'] }}</td></tr>
+            <tr><td><strong>Total</strong></td><td align="right"><strong>{{ '%.0f' % b['total'] }}</strong></td></tr>
           </table>
           <p>Meter: {{ b['start_reading'] }} → {{ b['end_reading'] }}</p>
           <p>Status: {{ 'Paid' if b['paid'] else 'Unpaid' }}</p>
-          <p style=\"margin-top:24px\">— Generated by {{ app_title }}</p>
+          <p style="margin-top:24px">— Generated by {{ app_title }}</p>
         </div>
         """,
         b=b,
@@ -830,6 +862,7 @@ def download_receipt(bill_id):
         app_title=APP_TITLE,
     )
     return html
+
 
 if __name__ == "__main__":
     # Local dev server
