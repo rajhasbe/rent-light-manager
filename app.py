@@ -174,20 +174,22 @@ CREATE TABLE IF NOT EXISTS users (
 
 
 def init_db():
-    """Create tables if they don't exist without requiring a Flask app context.
-    Uses a direct driver connection at import time so Gunicorn startup succeeds.
+    """
+    Create database tables if they don't exist.
+    Works for both PostgreSQL (production) and SQLite (local testing).
+    Avoids Flask app context issues by using direct connections.
     """
     if using_postgres():
         if psycopg2 is None:
             raise RuntimeError(
-                "psycopg2 is required for PostgreSQL but not installed. pip install psycopg2-binary"
+                "psycopg2 is required for PostgreSQL but not installed. "
+                "Run 'pip install psycopg2-binary'"
             )
         conn = psycopg2.connect(DATABASE_URL, sslmode=os.getenv("PGSSLMODE", "require"))
         try:
             cur = conn.cursor()
+            # Split schema safely by double newlines after semicolons
             statements = [s.strip() for s in POSTGRES_SCHEMA.strip().split(";\n\n") if s.strip()]
-
-") if s.strip()]
             for stmt in statements:
                 cur.execute(stmt)
             conn.commit()
@@ -197,11 +199,14 @@ def init_db():
             except Exception:
                 pass
     else:
+        # SQLite fallback for local testing
         with sqlite3.connect(DB_PATH) as conn:
             conn.executescript(SQLITE_SCHEMA)
 
+
 # Initialize DB on startup
 init_db()
+
 
 # --------------------- Templates ---------------------
 
